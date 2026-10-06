@@ -152,6 +152,33 @@ static String fmtSize(size_t n) {
   return String((n*10)/(1024*1024)/10.0, 1) + "M";
 }
 
+// CRC32 (IEEE) for verifying files uploaded to SD
+static uint32_t crc32Update(uint32_t crc, uint8_t b) {
+  static const uint32_t T[16] = {
+    0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC,
+    0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+    0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C,
+    0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C };
+  crc ^= b;
+  crc = (crc >> 4) ^ T[crc & 0xF];
+  crc = (crc >> 4) ^ T[crc & 0xF];
+  return crc;
+}
+static uint32_t fileCRC32(const String& p, size_t& outSize) {
+  outSize = 0;
+  File f = SD.open(p);
+  if (!f || f.isDirectory()) return 0;
+  outSize = f.size();
+  uint32_t crc = 0xFFFFFFFF;
+  uint8_t buf[1024];
+  while (f.available()) {
+    size_t r = f.read(buf, sizeof(buf));
+    for (size_t i = 0; i < r; i++) crc = crc32Update(crc, buf[i]);
+  }
+  f.close();
+  return crc ^ 0xFFFFFFFF;
+}
+
 // ---------- SD ----------
 static void scanDir(const String& path) {
   nEntries = 0; listTop = 0;
@@ -629,8 +656,51 @@ static void handleSerial() {
           if (p.length() >= 2 && ((p.startsWith("\"") && p.endsWith("\"")) || (p.startsWith("'") && p.endsWith("'"))))
             p = p.substring(1, p.length()-1);
           if (deletePath(p)) { scanDir(curPath); if (screen == Screen::LIST) drawList(); }
+        } else if (serBuf.startsWith("crc ")) {
+          String p = serBuf.substring(4); p.trim();
+          if (p.length() >= 2 && ((p.startsWith("\"") && p.endsWith("\"")) || (p.startsWith("'") && p.endsWith("'"))))
+            p = p.substring(1, p.length()-1);
+          size_t sz = 0;
+          uint32_t c = fileCRC32(p, sz);
+          if (!sz && !SD.exists(p)) Serial.println("ERR open");
+          else Serial.printf("CRC %08X %u\n", c, (unsigned)sz);
+        } else if (serBuf.startsWith("put ")) {
+          // put <path> <size> : PC sends command line, waits for READY,
+          // then streams <size> raw bytes which are written to SD.
+          String args = serBuf.substring(4); args.trim();
+          int sp = args.lastIndexOf(' ');
+          String p = (sp > 0) ? args.substring(0, sp) : args;
+          p.trim();
+          size_t total = (sp > 0) ? args.substring(sp + 1).toInt() : 0;
+          if (p.length() >= 2 && ((p.startsWith("\"") && p.endsWith("\"")) || (p.startsWith("'") && p.endsWith("'"))))
+            p = p.substring(1, p.length()-1);
+          if (total == 0 || total > 4*1024*1024) { Serial.println("ERR bad size"); }
+          else {
+            SD.remove(p);  // FILE_WRITE appends on ESP32 SD, so start fresh
+            File f = SD.open(p, FILE_WRITE);
+            if (!f) Serial.println("ERR open for write");
+            else {
+              Serial.printf("READY %u\n", (unsigned)total);
+              size_t got = 0;
+              uint8_t buf[512];
+              uint32_t t0 = millis();
+              while (got < total && millis() - t0 < 180000) {
+                size_t want = total - got;
+                if (want > sizeof(buf)) want = sizeof(buf);
+                size_t r = Serial.readBytes(buf, want);  // 1s timeout per call
+                if (r) { f.write(buf, r); got += r; }
+              }
+              f.close();
+              if (got == total) {
+                size_t sz = 0; uint32_t c = fileCRC32(p, sz);
+                Serial.printf("PUT OK %u CRC %08X\n", (unsigned)got, c);
+              } else Serial.printf("PUT SHORT %u/%u\n", (unsigned)got, (unsigned)total);
+              scanDir(curPath);
+              if (screen == Screen::LIST) drawList();
+            }
+          }
         } else if (serBuf == "reboot") ESP.restart();
-        else if (serBuf == "help") Serial.println("ls [p] | cat <f> | json <f> | flash <bin> | rm <f> | rmbruce | reboot");
+        else if (serBuf == "help") Serial.println("ls [p] | cat <f> | json <f> | flash <bin> | put <f> <size> | crc <f> | rm <f> | rmbruce | reboot");
         else Serial.println("unknown. try help");
       }
       serBuf = "";
@@ -640,9 +710,10 @@ static void handleSerial() {
 
 // ---------- setup/loop ----------
 void setup() {
+  Serial.setRxBufferSize(4096);  // tolerate SD write stalls during `put`
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== CYD SD LAUNCHER v2 ===");
+  Serial.println("\n=== CYD SD LAUNCHER v3 ===");
   lcd.init();
   lcd.setRotation(1);
   lcd.setBrightness(255);
@@ -664,7 +735,7 @@ void setup() {
     screen = Screen::NOSD;
     drawNoSD();
   }
-  Serial.println("Commands: ls | cat <f> | json <f> | flash <bin> | rm <f> | rmbruce | reboot");
+  Serial.println("Commands: ls | cat | json | flash | put | crc | rm | rmbruce | reboot");
 }
 
 void loop() {
