@@ -118,16 +118,24 @@ static bool entryIsDir[120];
 static size_t entrySize[120];
 static int nEntries = 0;
 static int listTop = 0;      // scroll offset
-static const int ROWS = 6;   // visible rows
+// v2 layout: 5 big rows, fat bottom bar (resistive-friendly)
+static const int ROWS = 5;
+static const int ROW_Y = 32;
+static const int ROW_H = 32;
+static const int BAR_Y = 196;   // bottom button bar starts here (44px tall)
 
-enum class Screen { LIST, VIEW, FLASH_CONFIRM, FLASHING, NOSD };
+enum class Screen { LIST, VIEW, FLASH_CONFIRM, DELETE_CONFIRM, FLASHING, NOSD };
 static Screen screen = Screen::LIST;
 static String viewPath = "";
 static String viewLines[400];
 static int nViewLines = 0;
 static int viewTop = 0;
-static const int VIEW_ROWS = 9;
+static const int VIEW_ROWS = 8;
+static const int VIEW_Y = 32;
+static const int VIEW_H = 19;
+static const int VIEW_BAR = 190;  // viewer bottom bar (50px tall)
 static String flashPath = "";
+static String delPath = "";
 
 // ---------- helpers ----------
 static uint16_t col(uint8_t r, uint8_t g, uint8_t b) {
@@ -198,6 +206,37 @@ static String baseName(const String& full) {
   return full.substring(k+1);
 }
 
+// Delete one file (or empty dir). Returns true on success.
+static bool deletePath(const String& p) {
+  if (p == "/" || p == "") return false;
+  File f = SD.open(p);
+  if (!f) { Serial.printf("DEL ERR: cannot open %s\n", p.c_str()); return false; }
+  bool isDir = f.isDirectory();
+  f.close();
+  bool ok = isDir ? SD.rmdir(p) : SD.remove(p);
+  Serial.printf("DEL %s : %s\n", p.c_str(), ok ? "OK" : "FAIL");
+  return ok;
+}
+
+// Bulk-remove Bruce firmware leftovers from the SD card.
+static void drawList();  // forward (defined in drawing section)
+static void deleteBruceLeftovers() {
+  static const char* bruceFiles[] = {
+    "/Crypto Prices.js", "/Device Info.js", "/Dino.js", "/EAN13.js",
+    "/Flappy Bird.js", "/Highway Racer.js", "/IR Brute Force.js",
+    "/Ping Pong.js", "/RGB Controller.js", "/Space Shooter.js",
+    "/Web Browser.js", "/WiFi Brute Force.js",
+    "/bruce.conf", "/brucePins.conf",
+    "/BruceAppStore/installed.json", nullptr
+  };
+  Serial.println("Removing Bruce leftovers...");
+  for (int i = 0; bruceFiles[i]; i++) deletePath(bruceFiles[i]);
+  if (SD.rmdir("/BruceAppStore")) Serial.println("DEL /BruceAppStore : OK (dir)");
+  else Serial.println("DEL /BruceAppStore : not empty or missing (kept)");
+  scanDir(curPath);
+  if (screen == Screen::LIST) drawList();
+}
+
 // Load text file into viewLines (wraps long lines at ~38 chars), parses JSON if applicable
 static void loadViewFile(const String& path) {
   viewPath = path; nViewLines = 0; viewTop = 0;
@@ -242,23 +281,32 @@ static void loadViewFile(const String& path) {
     }
     if (sz > cap && nViewLines < 400) viewLines[nViewLines++] = "...(truncated 16KB)...";
   } else {
-    // plain text viewer, cap 12KB
-    String line = "";
+    // plain text viewer, cap 12KB — chunked reads (fast even for big .js)
+    String line = ""; line.reserve(80);
     int count = 0;
-    while (f.available() && nViewLines < 400 && count < 12288) {
-      char c = (char)f.read(); count++;
-      if (c == '\r') continue;
-      if (c == '\n') {
-        while (line.length() > 38 && nViewLines < 400) {
-          viewLines[nViewLines++] = line.substring(0, 38);
-          line = line.substring(38);
-        }
-        if (nViewLines < 400) viewLines[nViewLines++] = line;
-        line = "";
-      } else line += c;
-      if (line.length() >= 76) {
+    uint8_t chunk[256];
+    auto pushLine = [&]() {
+      while (line.length() > 38 && nViewLines < 400) {
         viewLines[nViewLines++] = line.substring(0, 38);
         line = line.substring(38);
+      }
+      if (nViewLines < 400) viewLines[nViewLines++] = line;
+      line = "";
+    };
+    while (f.available() && nViewLines < 400 && count < 12288) {
+      size_t r = f.read(chunk, sizeof(chunk));
+      if (r == 0) break;
+      for (size_t k = 0; k < r && count < 12288 && nViewLines < 400; k++) {
+        char c = (char)chunk[k]; count++;
+        if (c == '\r') continue;
+        if (c == '\n') pushLine();
+        else {
+          line += c;
+          if (line.length() >= 76) {
+            viewLines[nViewLines++] = line.substring(0, 38);
+            line = line.substring(38);
+          }
+        }
       }
     }
     if (line.length() && nViewLines < 400) viewLines[nViewLines++] = line;
@@ -303,49 +351,48 @@ static void doFlashFromSD(const String& path) {
   ESP.restart();
 }
 
-// ---------- drawing ----------
+// ---------- drawing (v2: big rows + fat button bars) ----------
 static void drawList() {
   lcd.fillScreen(col(0,0,0));
   lcd.setTextSize(1);
-  // header
+  // header (tap = rescan)
   lcd.fillRect(0, 0, W, 28, col(20,40,90));
   lcd.setCursor(4, 4); lcd.setTextColor(col(255,255,0), col(20,40,90));
   lcd.printf("SD:%s", curPath.c_str());
   lcd.setCursor(4, 16); lcd.setTextColor(col(180,220,255), col(20,40,90));
-  if (sdOk) lcd.printf("%d files  TAP=open JPG/JSON  BIN=boot", nEntries);
+  if (sdOk) lcd.printf("%d files TAP=open SWIPE=scroll", nEntries);
   else lcd.print("NO SD CARD");
   // rows
-  int y = 32;
   for (int r = 0; r < ROWS; r++) {
     int i = listTop + r;
-    int yy = y + r * 30;
+    int yy = ROW_Y + r * ROW_H;
     if (i >= nEntries) {
-      lcd.fillRect(0, yy, W, 28, col(10,10,10));
+      lcd.fillRect(0, yy, W, ROW_H - 2, col(10,10,10));
       continue;
     }
     bool isBin = endsWithI(entries[i], ".bin");
-    bool isJson = endsWithI(entries[i], ".json");
+    bool isJson = endsWithI(entries[i], ".json") || endsWithI(entries[i], ".conf");
     uint16_t bg = entryIsDir[i] ? col(40,50,20) : (isBin ? col(90,20,20) : (isJson ? col(20,70,20) : col(25,25,25)));
-    lcd.fillRect(0, yy, W, 28, bg);
-    lcd.drawRect(0, yy, W, 28, col(80,80,80));
+    lcd.fillRect(0, yy, W, ROW_H - 2, bg);
+    lcd.drawRect(0, yy, W, ROW_H - 2, col(80,80,80));
     String bn = baseName(entries[i]);
     if (bn.length() > 30) bn = bn.substring(0, 29) + "~";
     lcd.setCursor(6, yy+4);
     lcd.setTextColor(col(255,255,255), bg);
     lcd.printf("%c %s", entryIsDir[i] ? '>' : (isBin ? '*' : (isJson ? 'J' : '-')), bn.c_str());
     if (!entryIsDir[i]) {
-      lcd.setCursor(6, yy+16);
+      lcd.setCursor(6, yy+18);
       lcd.setTextColor(col(170,170,170), bg);
       lcd.printf("  %s", fmtSize(entrySize[i]).c_str());
     }
   }
-  // scroll buttons + back
-  lcd.fillRect(0, 212, 80, 28, col(60,60,60));
-  lcd.setCursor(28, 220); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("^ UP");
-  lcd.fillRect(86, 212, 80, 28, col(60,60,60));
-  lcd.setCursor(112, 220); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("v DN");
-  lcd.fillRect(172, 212, 148, 28, col(90,60,10));
-  lcd.setCursor(210, 220); lcd.setTextColor(col(255,255,255), col(90,60,10)); lcd.print("BACK");
+  // fat bottom bar: UP / DOWN / BACK
+  lcd.fillRect(0, BAR_Y, 104, 240-BAR_Y, col(60,60,60));
+  lcd.setCursor(36, 214); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("^ UP");
+  lcd.fillRect(108, BAR_Y, 104, 240-BAR_Y, col(60,60,60));
+  lcd.setCursor(140, 214); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("v DN");
+  lcd.fillRect(216, BAR_Y, 104, 240-BAR_Y, col(90,60,10));
+  lcd.setCursor(244, 214); lcd.setTextColor(col(255,255,255), col(90,60,10)); lcd.print("BACK");
 }
 
 static void drawView() {
@@ -357,39 +404,57 @@ static void drawView() {
   if (bn.length() > 26) bn = bn.substring(0, 25) + "~";
   lcd.print(bn);
   lcd.setCursor(4, 16); lcd.setTextColor(col(200,255,200), col(20,60,20));
-  lcd.printf("%d lines  %d/%d", nViewLines, viewTop+1, nViewLines);
-  int y = 32;
+  lcd.printf("%d lines %d/%d  TAP-TOP=X", nViewLines, viewTop+1, nViewLines);
   lcd.setTextColor(col(230,230,230), col(0,0,0));
   for (int r = 0; r < VIEW_ROWS; r++) {
     int i = viewTop + r;
-    lcd.setCursor(4, y + r * 18);
+    lcd.setCursor(4, VIEW_Y + r * VIEW_H);
     if (i < nViewLines) lcd.print(viewLines[i]);
   }
-  lcd.fillRect(0, 212, 80, 28, col(60,60,60));
-  lcd.setCursor(28, 220); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("^ UP");
-  lcd.fillRect(86, 212, 80, 28, col(60,60,60));
-  lcd.setCursor(112, 220); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("v DN");
-  lcd.fillRect(240, 212, 80, 28, col(150,30,30));
-  lcd.setCursor(268, 220); lcd.setTextColor(col(255,255,255), col(150,30,30)); lcd.print("X");
+  int bh = 240 - VIEW_BAR;
+  lcd.fillRect(0, VIEW_BAR, 78, bh, col(60,60,60));
+  lcd.setCursor(22, 210); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("^ UP");
+  lcd.fillRect(82, VIEW_BAR, 78, bh, col(60,60,60));
+  lcd.setCursor(104, 210); lcd.setTextColor(col(255,255,255), col(60,60,60)); lcd.print("v DN");
+  lcd.fillRect(164, VIEW_BAR, 76, bh, col(150,90,10));
+  lcd.setCursor(182, 210); lcd.setTextColor(col(255,255,255), col(150,90,10)); lcd.print("DEL");
+  lcd.fillRect(244, VIEW_BAR, 76, bh, col(150,30,30));
+  lcd.setCursor(272, 210); lcd.setTextColor(col(255,255,255), col(150,30,30)); lcd.print("X");
+}
+
+static void drawConfirmBase(const char* title, uint16_t tcol, const String& path) {
+  lcd.fillScreen(col(0,0,0));
+  lcd.fillRect(0, 0, W, 28, tcol);
+  lcd.setCursor(60, 8); lcd.setTextSize(1);
+  lcd.setTextColor(col(255,255,255), tcol);
+  lcd.print(title);
+  lcd.setCursor(10, 50); lcd.setTextColor(col(255,255,255), col(0,0,0));
+  lcd.print(baseName(path));
+  File f = SD.open(path);
+  if (f && !f.isDirectory()) {
+    lcd.setCursor(10, 68); lcd.setTextColor(col(180,180,180), col(0,0,0));
+    lcd.printf("%s", fmtSize(f.size()).c_str());
+  }
+  if (f) f.close();
+  lcd.fillRect(20, 170, 130, 50, col(0,140,0));
+  lcd.setCursor(62, 190); lcd.setTextColor(col(255,255,255), col(0,140,0)); lcd.print("YES");
+  lcd.fillRect(170, 170, 130, 50, col(140,0,0));
+  lcd.setCursor(222, 190); lcd.setTextColor(col(255,255,255), col(140,0,0)); lcd.print("NO");
 }
 
 static void drawFlashConfirm() {
-  lcd.fillScreen(col(0,0,0));
-  lcd.fillRect(0, 0, W, 28, col(120,20,20));
-  lcd.setCursor(60, 8); lcd.setTextColor(col(255,255,255), col(120,20,20));
-  lcd.print("BOOT THIS GAME?");
-  lcd.setCursor(10, 50); lcd.setTextColor(col(255,255,255), col(0,0,0));
-  lcd.print(baseName(flashPath));
-  lcd.setCursor(10, 70); lcd.setTextColor(col(180,180,180), col(0,0,0));
-  lcd.printf("%s bytes", fmtSize(SD.open(flashPath).size()).c_str());
-  lcd.setCursor(10, 95); lcd.print("Flash + reboot into game?");
-  lcd.setCursor(10, 115); lcd.print("Launcher stays in flash;");
-  lcd.setCursor(10, 130); lcd.print("re-flash launcher.bin to");
-  lcd.setCursor(10, 145); lcd.print("come back.");
-  lcd.fillRect(20, 175, 130, 40, col(0,140,0));
-  lcd.setCursor(60, 190); lcd.setTextColor(col(255,255,255), col(0,140,0)); lcd.print("YES");
-  lcd.fillRect(170, 175, 130, 40, col(140,0,0));
-  lcd.setCursor(220, 190); lcd.setTextColor(col(255,255,255), col(140,0,0)); lcd.print("NO");
+  drawConfirmBase("BOOT THIS GAME?", col(120,20,20), flashPath);
+  lcd.setCursor(10, 95); lcd.setTextColor(col(255,255,255), col(0,0,0));
+  lcd.print("Flash + reboot into game?");
+  lcd.setCursor(10, 115); lcd.print("Keep launcher.bin on SD");
+  lcd.setCursor(10, 130); lcd.print("to come back.");
+}
+
+static void drawDeleteConfirm() {
+  drawConfirmBase("DELETE THIS FILE?", col(120,80,10), delPath);
+  lcd.setCursor(10, 95); lcd.setTextColor(col(255,255,255), col(0,0,0));
+  lcd.print("Delete from SD card?");
+  lcd.setCursor(10, 115); lcd.print("This cannot be undone.");
 }
 
 static void drawNoSD() {
@@ -401,14 +466,120 @@ static void drawNoSD() {
   lcd.setCursor(60, 135); lcd.print("SCK=18, FAT32 format");
 }
 
-// ---------- touch (debounced, edge-triggered) ----------
-static bool touchPressed(int &tx, int &ty) {
-  static bool was = false;
+// ---------- touch: press/release tracking, tap vs swipe ----------
+// A press followed by release with little movement = tap (uses press point).
+// A press dragged >28px = swipe (scrolls, works anywhere on screen).
+static bool tDown = false;
+static int tDX = 0, tDY = 0, tLX = 0, tLY = 0;
+
+static void scrollList(int dir) {  // dir +1 = down a line, -1 = up a line
+  if (dir > 0) { if (listTop + ROWS < nEntries) listTop++; }
+  else if (listTop > 0) listTop--;
+  drawList();
+}
+static void scrollView(int dir) {
+  if (dir > 0) { if (viewTop + VIEW_ROWS < nViewLines) viewTop++; }
+  else if (viewTop > 0) viewTop--;
+  drawView();
+}
+
+static void openEntry(const String& full, bool isDir) {
+  if (isDir) { scanDir(full); drawList(); return; }
+  if (endsWithI(full, ".bin")) { flashPath = full; screen = Screen::FLASH_CONFIRM; drawFlashConfirm(); return; }
+  if (endsWithI(full, ".jpg") || endsWithI(full, ".jpeg")) {
+    viewPath = full; nViewLines = 0; viewTop = 0;
+    viewLines[nViewLines++] = "JPG preview not in";
+    viewLines[nViewLines++] = "bare-bones build.";
+    viewLines[nViewLines++] = "";
+    viewLines[nViewLines++] = "Use BIN to boot,";
+    viewLines[nViewLines++] = "JSON/TXT to view.";
+    viewLines[nViewLines++] = "";
+    viewLines[nViewLines++] = full;
+    screen = Screen::VIEW; drawView(); return;
+  }
+  loadViewFile(full); screen = Screen::VIEW; drawView();
+}
+
+static void goUp() {
+  if (curPath == "/") return;
+  String p = curPath;
+  if (p.endsWith("/") && p.length() > 1) p = p.substring(0, p.length()-1);
+  int k = p.lastIndexOf('/');
+  scanDir((k <= 0) ? "/" : p.substring(0, k));
+  drawList();
+}
+
+static void handleTap(int tx, int ty) {
+  Serial.printf("tap %d,%d screen=%d\n", tx, ty, (int)screen);
+  if (screen == Screen::LIST) {
+    if (ty < 28) { scanDir(curPath); drawList(); return; }  // header = refresh
+    if (ty >= BAR_Y) {
+      if (tx < 106) scrollList(-1);
+      else if (tx < 212) scrollList(+1);
+      else goUp();
+      return;
+    }
+    int row = (ty - ROW_Y) / ROW_H;
+    int idx = listTop + row;
+    if (row >= 0 && row < ROWS && idx < nEntries) {
+      Serial.printf("open %s\n", entries[idx].c_str());
+      openEntry(entries[idx], entryIsDir[idx]);
+    } else Serial.println("tap on empty row (ignored)");
+  } else if (screen == Screen::VIEW) {
+    if (ty < 28) { screen = Screen::LIST; drawList(); return; }  // header = exit
+    if (ty < VIEW_BAR) return;  // text area: swipe to scroll, taps ignored
+    if (tx < 80) scrollView(-1);
+    else if (tx < 162) scrollView(+1);
+    else if (tx < 242) {
+      if (!viewPath.isEmpty()) { delPath = viewPath; screen = Screen::DELETE_CONFIRM; drawDeleteConfirm(); }
+    }
+    else { screen = Screen::LIST; drawList(); }
+  } else if (screen == Screen::FLASH_CONFIRM) {
+    if (ty >= 165) {
+      if (tx < 160) {
+        screen = Screen::FLASHING;
+        lcd.fillScreen(0);
+        lcd.setCursor(30, 60); lcd.print("Flashing...");
+        lcd.drawRect(20, 130, 280, 16, col(255,255,255));
+        doFlashFromSD(flashPath);
+        lcd.setCursor(30, 170); lcd.print("FLASH FAILED - tap for list");
+        screen = Screen::LIST;
+      } else { screen = Screen::LIST; drawList(); }
+    }
+  } else if (screen == Screen::DELETE_CONFIRM) {
+    if (ty >= 165) {
+      if (tx < 160) {
+        deletePath(delPath);
+        if (viewPath == delPath) viewPath = "";
+        delPath = "";
+        scanDir(curPath); screen = Screen::LIST; drawList();
+      } else { delPath = ""; screen = Screen::VIEW; drawView(); }
+    }
+  } else if (screen == Screen::NOSD) {
+    sdOk = SD.begin(SD_CS, sdSpi, 10000000);
+    if (sdOk) { scanDir("/"); screen = Screen::LIST; drawList(); }
+    else drawNoSD();
+  }
+}
+
+static void handleSwipe(int dy) {
+  Serial.printf("swipe dy=%d screen=%d\n", dy, (int)screen);
+  int dir = (dy < 0) ? +1 : -1;  // swipe up = content moves up = next lines
+  if (screen == Screen::LIST) scrollList(dir);
+  else if (screen == Screen::VIEW) scrollView(dir);
+}
+
+static void pollTouch() {
   int x, y;
   bool now = lcd.getTouch(&x, &y);
-  if (now && !was) { tx = x; ty = y; was = true; return true; }
-  if (!now) was = false;
-  return false;
+  if (now && !tDown) { tDown = true; tDX = tLX = x; tDY = tLY = y; }
+  else if (now && tDown) { tLX = x; tLY = y; }
+  else if (!now && tDown) {
+    tDown = false;
+    int dx = tLX - tDX, dy = tLY - tDY;
+    if (abs(dy) > 28 || abs(dx) > 28) handleSwipe(dy);
+    else handleTap(tDX, tDY);
+  }
 }
 
 // ---------- serial commands ----------
@@ -448,9 +619,18 @@ static void handleSerial() {
           }
         } else if (serBuf.startsWith("flash ")) {
           String p = serBuf.substring(6); p.trim();
+          if (p.length() >= 2 && ((p.startsWith("\"") && p.endsWith("\"")) || (p.startsWith("'") && p.endsWith("'"))))
+            p = p.substring(1, p.length()-1);
           doFlashFromSD(p);
+        } else if (serBuf.startsWith("rmbruce")) {
+          deleteBruceLeftovers();
+        } else if (serBuf.startsWith("rm ")) {
+          String p = serBuf.substring(3); p.trim();
+          if (p.length() >= 2 && ((p.startsWith("\"") && p.endsWith("\"")) || (p.startsWith("'") && p.endsWith("'"))))
+            p = p.substring(1, p.length()-1);
+          if (deletePath(p)) { scanDir(curPath); if (screen == Screen::LIST) drawList(); }
         } else if (serBuf == "reboot") ESP.restart();
-        else if (serBuf == "help") Serial.println("ls [p] | cat <f> | json <f> | flash <bin> | reboot");
+        else if (serBuf == "help") Serial.println("ls [p] | cat <f> | json <f> | flash <bin> | rm <f> | rmbruce | reboot");
         else Serial.println("unknown. try help");
       }
       serBuf = "";
@@ -462,7 +642,7 @@ static void handleSerial() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== CYD SD LAUNCHER v1 ===");
+  Serial.println("\n=== CYD SD LAUNCHER v2 ===");
   lcd.init();
   lcd.setRotation(1);
   lcd.setBrightness(255);
@@ -484,77 +664,11 @@ void setup() {
     screen = Screen::NOSD;
     drawNoSD();
   }
-  Serial.println("Commands: ls | cat <f> | json <f> | flash <bin> | reboot");
+  Serial.println("Commands: ls | cat <f> | json <f> | flash <bin> | rm <f> | rmbruce | reboot");
 }
 
 void loop() {
   handleSerial();
-  int tx, ty;
-  if (touchPressed(tx, ty)) {
-    Serial.printf("touch %d,%d screen=%d\n", tx, ty, (int)screen);
-    if (screen == Screen::LIST) {
-      if (ty >= 212) {
-        if (tx < 80) { if (listTop > 0) { listTop--; drawList(); } }
-        else if (tx < 166) { if (listTop + ROWS < nEntries) { listTop++; drawList(); } }
-        else {
-          if (curPath != "/") {
-            String p = curPath;
-            if (p.endsWith("/") && p.length() > 1) p = p.substring(0, p.length()-1);
-            int k = p.lastIndexOf('/');
-            String up = (k <= 0) ? "/" : p.substring(0, k);
-            scanDir(up); drawList();
-          }
-        }
-        return;
-      }
-      int row = (ty - 32) / 30;
-      int idx = listTop + row;
-      if (row >= 0 && row < ROWS && idx < nEntries) {
-        String full = entries[idx];
-        if (entryIsDir[idx]) { scanDir(full); drawList(); }
-        else if (endsWithI(full, ".bin")) { flashPath = full; screen = Screen::FLASH_CONFIRM; drawFlashConfirm(); }
-        else if (endsWithI(full, ".jpg") || endsWithI(full, ".jpeg")) {
-          loadViewFile("/"); // placeholder
-          viewPath = full;
-          nViewLines = 0; viewTop = 0;
-          viewLines[nViewLines++] = "JPG preview not in";
-          viewLines[nViewLines++] = "bare-bones build.";
-          viewLines[nViewLines++] = "";
-          viewLines[nViewLines++] = "Use BIN to boot,";
-          viewLines[nViewLines++] = "JSON/TXT to view.";
-          viewLines[nViewLines++] = "";
-          viewLines[nViewLines++] = full;
-          screen = Screen::VIEW; drawView();
-        }
-        else { loadViewFile(full); screen = Screen::VIEW; drawView(); }
-      }
-    } else if (screen == Screen::VIEW) {
-      if (ty >= 212) {
-        if (tx < 80) { if (viewTop > 0) { viewTop--; drawView(); } }
-        else if (tx < 166) { if (viewTop + VIEW_ROWS < nViewLines) { viewTop++; drawView(); } }
-        else if (tx >= 240) { screen = Screen::LIST; drawList(); }
-      }
-    } else if (screen == Screen::FLASH_CONFIRM) {
-      if (ty >= 175) {
-        if (tx < 150) {
-          screen = Screen::FLASHING;
-          lcd.fillScreen(0);
-          lcd.setCursor(30, 60); lcd.print("Flashing...");
-          lcd.drawRect(20, 130, 280, 16, col(255,255,255));
-          doFlashFromSD(flashPath);
-          // if we get here flash failed
-          lcd.setCursor(30, 170); lcd.print("FLASH FAILED - tap to go back");
-          screen = Screen::LIST;
-        } else {
-          screen = Screen::LIST; drawList();
-        }
-      }
-    } else if (screen == Screen::NOSD) {
-      // retry SD on any tap
-      sdOk = SD.begin(SD_CS, sdSpi, 10000000);
-      if (sdOk) { scanDir("/"); screen = Screen::LIST; drawList(); }
-      else drawNoSD();
-    }
-  }
+  pollTouch();
   delay(20);
 }
