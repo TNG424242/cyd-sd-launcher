@@ -9,15 +9,19 @@ Bare-bones firmware currently flashed on your CYD (v3). It mounts the SD card
 - Loads JSON files: tap a `.json` (or `.conf`/`.js`/`.txt`) to view it.
   JSON is parsed with ArduinoJson and pretty-printed; parse errors are shown.
 - Boots `.bin` games from SD: tap a `.bin` → YES → OTA flash + reboot.
-  Verified: `flash /invaders.bin` from SD rebooted straight into INVASION 2030.
+  Verified round trip on hardware: launcher → frank → launcher → invaders
+  → launcher, all switched on-device.
+- Each game can come back on its own: HOLD the top-left corner for 3 seconds
+  → `EXIT TO LAUNCHER?` → TAP to confirm (wait 6s to cancel). Needs
+  `/launcher.bin` on the SD card. Serial `exit` in a game does the same.
 - Deletes files: open a file, tap DEL → YES. Or over serial: `rm <file>`.
 - Uploads files to SD over USB serial: `put <path> <size>` then stream the
   bytes; `crc <file>` verifies with CRC32. This is how the game bins below
   were written to the card without removing it.
 
 ## What's on the SD card now (verified with CRC32 over serial)
-- `/frank-tunnel-run.bin` (463072 bytes) — FRANK TUNNEL RUN, boots OK
-- `/invaders.bin` (375168 bytes) — INVASION 2030, boots OK (also SD-boot tested)
+- `/frank-tunnel-run.bin` (521424 bytes) — FRANK TUNNEL RUN, boots OK, exits back OK
+- `/invaders.bin` (433424 bytes) — INVASION 2030, boots OK, exits back OK
 - `/launcher.bin` (this launcher v3 — tap it + YES to come back after a game)
 
 The old Bruce leftovers (12 `.js` apps, `bruce.conf`, `brucePins.conf`,
