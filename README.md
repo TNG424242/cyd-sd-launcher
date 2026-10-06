@@ -1,6 +1,6 @@
 # CYD 2432S028 SD Launcher — bare-bones JSON loader + game booter
 
-Bare-bones firmware currently flashed on your CYD (v3). It mounts the SD card
+Bare-bones firmware currently flashed on your CYD (v4). It mounts the SD card
 (VSPI MOSI 23 / MISO 19 / SCK 18 / CS 5) and lets you browse files on the
 320x240 touch screen and over USB serial (115200).
 
@@ -22,7 +22,7 @@ Bare-bones firmware currently flashed on your CYD (v3). It mounts the SD card
 ## What's on the SD card now (verified with CRC32 over serial)
 - `/frank-tunnel-run.bin` (521424 bytes) — FRANK TUNNEL RUN, boots OK, exits back OK
 - `/invaders.bin` (433424 bytes) — INVASION 2030, boots OK, exits back OK
-- `/launcher.bin` (this launcher v3 — tap it + YES to come back after a game)
+- `/launcher.bin` (this launcher v4 — tap it + YES to come back after a game)
 
 The old Bruce leftovers (12 `.js` apps, `bruce.conf`, `brucePins.conf`,
 `BruceAppStore/`) were deleted with `rmbruce`.
