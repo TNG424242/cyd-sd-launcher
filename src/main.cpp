@@ -713,9 +713,9 @@ void setup() {
   Serial.setRxBufferSize(4096);  // tolerate SD write stalls during `put`
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== CYD SD LAUNCHER v3 ===");
+  Serial.println("\n=== CYD SD LAUNCHER v4 ===");
   lcd.init();
-  lcd.setRotation(1);
+  lcd.setRotation(0);  // ILI9342 landscape-native: rot 0 = 320x240 (must match games)
   lcd.setBrightness(255);
   lcd.fillScreen(0);
   lcd.setTextSize(1);
